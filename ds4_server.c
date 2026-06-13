@@ -7606,6 +7606,7 @@ typedef struct {
     char call_id[CORRELATION_ID_MAX];
     char trace_id[33];
     char parent_span_id[17];
+    uint8_t trace_flags;
     char client_id[CORRELATION_ID_MAX];
     char agent_id[CORRELATION_ID_MAX];
 } correlation_context;
@@ -7672,6 +7673,402 @@ static void server_log(ds4_log_type type, const char *fmt, ...) {
     va_end(ap);
     fputc('\n', stderr);
     funlockfile(stderr);
+}
+
+#define OTLP_SPAN_QUEUE_CAPACITY 64
+#define OTLP_CONNECT_TIMEOUT_MS 1000
+#define OTLP_IO_TIMEOUT_MS 1500
+#define OTLP_WARNING_INTERVAL_NS (60ull * 1000000000ull)
+
+typedef struct {
+    uint16_t port;
+    char path[256];
+} otlp_http_endpoint;
+
+typedef struct {
+    char trace_id[33];
+    char span_id[17];
+    char parent_span_id[17];
+    uint8_t trace_flags;
+    char session_id[CORRELATION_ID_MAX];
+    char call_id[CORRELATION_ID_MAX];
+    char client_id[CORRELATION_ID_MAX];
+    char agent_id[CORRELATION_ID_MAX];
+    uint64_t queue_accepted_unix_ns;
+    uint64_t worker_start_unix_ns;
+    uint64_t worker_done_unix_ns;
+} otlp_span_record;
+
+typedef struct {
+    bool enabled;
+    bool thread_started;
+    bool stopping;
+    pthread_t thread;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    otlp_http_endpoint endpoint;
+    otlp_span_record queue[OTLP_SPAN_QUEUE_CAPACITY];
+    size_t head;
+    size_t count;
+    uint64_t submitted;
+    uint64_t exported;
+    uint64_t dropped;
+    uint64_t failed;
+} otlp_span_exporter;
+
+static bool otlp_http_endpoint_parse(const char *value,
+                                     otlp_http_endpoint *endpoint) {
+    if (!value || !endpoint) return false;
+    const char *prefix = NULL;
+    if (!strncmp(value, "http://127.0.0.1:", 17)) {
+        prefix = value + 17;
+    } else if (!strncmp(value, "http://localhost:", 17)) {
+        prefix = value + 17;
+    } else {
+        return false;
+    }
+
+    char *end = NULL;
+    errno = 0;
+    long port = strtol(prefix, &end, 10);
+    if (errno || end == prefix || port <= 0 || port > 65535 || *end != '/') {
+        return false;
+    }
+    size_t path_len = strlen(end);
+    if (path_len < 2 || path_len >= sizeof(endpoint->path)) return false;
+    for (size_t i = 0; i < path_len; i++) {
+        unsigned char c = (unsigned char)end[i];
+        if (c <= 0x20 || c >= 0x7f) return false;
+    }
+
+    memset(endpoint, 0, sizeof(*endpoint));
+    endpoint->port = (uint16_t)port;
+    memcpy(endpoint->path, end, path_len + 1);
+    return true;
+}
+
+static bool make_span_id(char span_id[17]) {
+    static const char hex[] = "0123456789abcdef";
+    unsigned char bytes[8];
+    for (int attempt = 0; attempt < 4; attempt++) {
+        if (!random_bytes(bytes, sizeof(bytes))) return false;
+        bool nonzero = false;
+        for (size_t i = 0; i < sizeof(bytes); i++) {
+            if (bytes[i]) nonzero = true;
+            span_id[i * 2] = hex[bytes[i] >> 4];
+            span_id[i * 2 + 1] = hex[bytes[i] & 0x0f];
+        }
+        span_id[16] = '\0';
+        if (nonzero) return true;
+    }
+    span_id[0] = '\0';
+    return false;
+}
+
+static bool correlation_context_is_sampled(const correlation_context *corr) {
+    return corr && corr->trace_id[0] && corr->parent_span_id[0] &&
+           (corr->trace_flags & 1u) != 0;
+}
+
+static void otlp_append_string_attribute(buf *b, const char *key,
+                                         const char *value) {
+    buf_puts(b, "{\"key\":");
+    json_escape(b, key);
+    buf_puts(b, ",\"value\":{\"stringValue\":");
+    json_escape(b, value);
+    buf_puts(b, "}}");
+}
+
+static void otlp_append_double_attribute(buf *b, const char *key,
+                                         double value) {
+    buf_puts(b, "{\"key\":");
+    json_escape(b, key);
+    buf_printf(b, ",\"value\":{\"doubleValue\":%.6f}}", value);
+}
+
+static char *otlp_span_payload(const otlp_span_record *record) {
+    double queue_wait_ms = record->worker_start_unix_ns >= record->queue_accepted_unix_ns
+        ? (double)(record->worker_start_unix_ns - record->queue_accepted_unix_ns) / 1000000.0
+        : 0.0;
+    double worker_duration_ms = record->worker_done_unix_ns >= record->worker_start_unix_ns
+        ? (double)(record->worker_done_unix_ns - record->worker_start_unix_ns) / 1000000.0
+        : 0.0;
+
+    buf b = {0};
+    buf_puts(&b, "{\"resourceSpans\":[{\"resource\":{\"attributes\":[");
+    otlp_append_string_attribute(&b, "service.name", "ds4-server");
+    buf_putc(&b, ',');
+    otlp_append_string_attribute(&b, "service.namespace", "local-llm-research");
+    buf_putc(&b, ',');
+    otlp_append_string_attribute(&b, "host.name", "m2ultra");
+    buf_putc(&b, ',');
+    otlp_append_string_attribute(&b, "endpoint_id", "ds4-main");
+    buf_puts(&b, "]},\"scopeSpans\":[{\"scope\":{\"name\":\"ds4-server\",\"version\":\"1\"},\"spans\":[{");
+    buf_puts(&b, "\"traceId\":");
+    json_escape(&b, record->trace_id);
+    buf_puts(&b, ",\"spanId\":");
+    json_escape(&b, record->span_id);
+    buf_puts(&b, ",\"parentSpanId\":");
+    json_escape(&b, record->parent_span_id);
+    buf_printf(&b, ",\"flags\":%u,\"name\":\"ds4.inference\",\"kind\":2,"
+                   "\"startTimeUnixNano\":\"%llu\",\"endTimeUnixNano\":\"%llu\","
+                   "\"attributes\":[",
+               (unsigned)record->trace_flags,
+               (unsigned long long)record->queue_accepted_unix_ns,
+               (unsigned long long)record->worker_done_unix_ns);
+    otlp_append_string_attribute(&b, "llm.session_id", correlation_value(record->session_id));
+    buf_putc(&b, ',');
+    otlp_append_string_attribute(&b, "llm.call_id", correlation_value(record->call_id));
+    buf_putc(&b, ',');
+    otlp_append_string_attribute(&b, "llm.client_id", correlation_value(record->client_id));
+    buf_putc(&b, ',');
+    otlp_append_string_attribute(&b, "llm.agent_id", correlation_value(record->agent_id));
+    buf_putc(&b, ',');
+    otlp_append_string_attribute(&b, "llm.endpoint_id", "ds4-main");
+    buf_putc(&b, ',');
+    otlp_append_double_attribute(&b, "ds4.queue.wait_ms", queue_wait_ms);
+    buf_putc(&b, ',');
+    otlp_append_double_attribute(&b, "ds4.worker.duration_ms", worker_duration_ms);
+    buf_printf(&b,
+        "],\"events\":["
+        "{\"timeUnixNano\":\"%llu\",\"name\":\"ds4.queue.accepted\"},"
+        "{\"timeUnixNano\":\"%llu\",\"name\":\"ds4.worker.started\"},"
+        "{\"timeUnixNano\":\"%llu\",\"name\":\"ds4.worker.done\"}"
+        "]}]}]}]}",
+        (unsigned long long)record->queue_accepted_unix_ns,
+        (unsigned long long)record->worker_start_unix_ns,
+        (unsigned long long)record->worker_done_unix_ns);
+    return buf_take(&b);
+}
+
+static bool otlp_wait_fd(int fd, short events, long long deadline_ms) {
+    for (;;) {
+        long long remaining = deadline_ms - wall_ms();
+        if (remaining <= 0) return false;
+        struct pollfd pfd = {.fd = fd, .events = events};
+        int timeout = remaining > INT_MAX ? INT_MAX : (int)remaining;
+        int rc = poll(&pfd, 1, timeout);
+        if (rc < 0 && errno == EINTR) continue;
+        if (rc <= 0) return false;
+        if (pfd.revents & events) return true;
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return false;
+    }
+}
+
+static bool otlp_write_all(int fd, const char *data, size_t len) {
+    long long deadline = wall_ms() + OTLP_IO_TIMEOUT_MS;
+    while (len) {
+        ssize_t written = send(fd, data, len, 0);
+        if (written < 0 && errno == EINTR) continue;
+        if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (!otlp_wait_fd(fd, POLLOUT, deadline)) return false;
+            continue;
+        }
+        if (written <= 0) return false;
+        data += written;
+        len -= (size_t)written;
+    }
+    return true;
+}
+
+static int otlp_http_post(const otlp_http_endpoint *endpoint,
+                          const char *payload) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(endpoint->port);
+    inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    int rc = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+    if (rc != 0) {
+        if (errno != EINPROGRESS ||
+            !otlp_wait_fd(fd, POLLOUT, wall_ms() + OTLP_CONNECT_TIMEOUT_MS)) {
+            close(fd);
+            return -1;
+        }
+        int socket_error = 0;
+        socklen_t socket_error_len = sizeof(socket_error);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error,
+                       &socket_error_len) != 0 || socket_error != 0) {
+            close(fd);
+            return -1;
+        }
+    }
+
+    size_t payload_len = strlen(payload);
+    buf request = {0};
+    buf_printf(&request,
+               "POST %s HTTP/1.1\r\n"
+               "Host: 127.0.0.1:%u\r\n"
+               "Content-Type: application/json\r\n"
+               "Content-Length: %zu\r\n"
+               "Connection: close\r\n\r\n",
+               endpoint->path, (unsigned)endpoint->port, payload_len);
+    buf_append(&request, payload, payload_len);
+    bool sent = otlp_write_all(fd, request.ptr, request.len);
+    buf_free(&request);
+    if (!sent) {
+        close(fd);
+        return -1;
+    }
+
+    char status_line[256];
+    size_t used = 0;
+    long long deadline = wall_ms() + OTLP_IO_TIMEOUT_MS;
+    while (used + 1 < sizeof(status_line)) {
+        ssize_t n = recv(fd, status_line + used, sizeof(status_line) - used - 1, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (!otlp_wait_fd(fd, POLLIN, deadline)) break;
+            continue;
+        }
+        if (n <= 0) break;
+        used += (size_t)n;
+        status_line[used] = '\0';
+        if (strstr(status_line, "\r\n") || strchr(status_line, '\n')) break;
+    }
+    close(fd);
+    status_line[used] = '\0';
+    int status = 0;
+    if (sscanf(status_line, "HTTP/%*u.%*u %d", &status) != 1) return -1;
+    return status;
+}
+
+static bool otlp_status_retryable(int status) {
+    return status < 0 || status == 429 || status == 502 ||
+           status == 503 || status == 504;
+}
+
+static void *otlp_exporter_main(void *arg) {
+    otlp_span_exporter *exporter = arg;
+    uint64_t last_warning_unix_ns = 0;
+    uint64_t last_reported_dropped = 0;
+    for (;;) {
+        pthread_mutex_lock(&exporter->mu);
+        while (!exporter->count && !exporter->stopping) {
+            pthread_cond_wait(&exporter->cv, &exporter->mu);
+        }
+        if (exporter->stopping) {
+            pthread_mutex_unlock(&exporter->mu);
+            break;
+        }
+        otlp_span_record record = exporter->queue[exporter->head];
+        exporter->head = (exporter->head + 1) % OTLP_SPAN_QUEUE_CAPACITY;
+        exporter->count--;
+        pthread_mutex_unlock(&exporter->mu);
+
+        char *payload = otlp_span_payload(&record);
+        int status = otlp_http_post(&exporter->endpoint, payload);
+        if (status != 200 && otlp_status_retryable(status)) {
+            struct timespec delay = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000};
+            nanosleep(&delay, NULL);
+            status = otlp_http_post(&exporter->endpoint, payload);
+        }
+        free(payload);
+
+        if (status == 200) {
+            __sync_fetch_and_add(&exporter->exported, 1);
+        } else {
+            __sync_fetch_and_add(&exporter->failed, 1);
+            uint64_t now = unix_time_ns();
+            if (!last_warning_unix_ns ||
+                now - last_warning_unix_ns >= OTLP_WARNING_INTERVAL_NS) {
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: OTLP trace export failed status=%d; inference continues",
+                           status);
+                last_warning_unix_ns = now;
+            }
+        }
+
+        uint64_t dropped = __sync_fetch_and_add(&exporter->dropped, 0);
+        if (dropped != last_reported_dropped) {
+            uint64_t now = unix_time_ns();
+            if (!last_warning_unix_ns ||
+                now - last_warning_unix_ns >= OTLP_WARNING_INTERVAL_NS) {
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: OTLP trace queue dropped=%llu; inference continues",
+                           (unsigned long long)dropped);
+                last_warning_unix_ns = now;
+            }
+            last_reported_dropped = dropped;
+        }
+    }
+    return NULL;
+}
+
+static bool otlp_exporter_start(otlp_span_exporter *exporter,
+                                const otlp_http_endpoint *endpoint) {
+    memset(exporter, 0, sizeof(*exporter));
+    if (!endpoint || !endpoint->port) return true;
+    exporter->endpoint = *endpoint;
+    if (pthread_mutex_init(&exporter->mu, NULL) != 0) return false;
+    if (pthread_cond_init(&exporter->cv, NULL) != 0) {
+        pthread_mutex_destroy(&exporter->mu);
+        return false;
+    }
+    exporter->enabled = true;
+    if (pthread_create(&exporter->thread, NULL, otlp_exporter_main, exporter) != 0) {
+        exporter->enabled = false;
+        pthread_cond_destroy(&exporter->cv);
+        pthread_mutex_destroy(&exporter->mu);
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: failed to start OTLP exporter; inference continues without spans");
+        return false;
+    }
+    exporter->thread_started = true;
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: OTLP traces enabled endpoint=http://127.0.0.1:%u%s queue_capacity=%d",
+               (unsigned)endpoint->port, endpoint->path, OTLP_SPAN_QUEUE_CAPACITY);
+    return true;
+}
+
+static bool otlp_exporter_submit(otlp_span_exporter *exporter,
+                                 const otlp_span_record *record) {
+    if (!exporter || !exporter->enabled || !record) return false;
+    if (pthread_mutex_trylock(&exporter->mu) != 0) {
+        __sync_fetch_and_add(&exporter->dropped, 1);
+        return false;
+    }
+    if (exporter->stopping || exporter->count == OTLP_SPAN_QUEUE_CAPACITY) {
+        pthread_mutex_unlock(&exporter->mu);
+        __sync_fetch_and_add(&exporter->dropped, 1);
+        return false;
+    }
+    size_t tail = (exporter->head + exporter->count) % OTLP_SPAN_QUEUE_CAPACITY;
+    exporter->queue[tail] = *record;
+    exporter->count++;
+    __sync_fetch_and_add(&exporter->submitted, 1);
+    pthread_cond_signal(&exporter->cv);
+    pthread_mutex_unlock(&exporter->mu);
+    return true;
+}
+
+static void otlp_exporter_stop(otlp_span_exporter *exporter) {
+    if (!exporter || !exporter->enabled) return;
+    pthread_mutex_lock(&exporter->mu);
+    size_t pending = exporter->count;
+    exporter->count = 0;
+    exporter->stopping = true;
+    pthread_cond_broadcast(&exporter->cv);
+    pthread_mutex_unlock(&exporter->mu);
+    if (pending) __sync_fetch_and_add(&exporter->dropped, pending);
+    if (exporter->thread_started) pthread_join(exporter->thread, NULL);
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: OTLP traces stopped submitted=%llu exported=%llu dropped=%llu failed=%llu",
+               (unsigned long long)__sync_fetch_and_add(&exporter->submitted, 0),
+               (unsigned long long)__sync_fetch_and_add(&exporter->exported, 0),
+               (unsigned long long)__sync_fetch_and_add(&exporter->dropped, 0),
+               (unsigned long long)__sync_fetch_and_add(&exporter->failed, 0));
+    pthread_cond_destroy(&exporter->cv);
+    pthread_mutex_destroy(&exporter->mu);
+    memset(exporter, 0, sizeof(*exporter));
 }
 
 typedef struct job job;
@@ -7774,6 +8171,7 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    otlp_span_exporter otlp;
 };
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
@@ -7783,6 +8181,7 @@ struct job {
     int fd;
     request req;
     correlation_context corr;
+    char inference_span_id[17];
     uint64_t queue_accepted_unix_ns;
     uint64_t worker_start_unix_ns;
     bool done;
@@ -11103,6 +11502,9 @@ static bool enqueue(server *s, job *j) {
         return false;
     }
     j->queue_accepted_unix_ns = unix_time_ns();
+    if (s->otlp.enabled && correlation_context_is_sampled(&j->corr)) {
+        (void)make_span_id(j->inference_span_id);
+    }
     if (s->tail) s->tail->next = j; else s->head = j;
     s->tail = j;
     pthread_cond_signal(&s->cv);
@@ -11141,10 +11543,27 @@ static void *worker_main(void *arg) {
                    (unsigned long long)j->worker_start_unix_ns,
                    queue_wait_ms);
         generate_job(s, j);
+        uint64_t worker_done_unix_ns = unix_time_ns();
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: event=worker_done worker_start_unix_ns=%llu worker_done_unix_ns=%llu",
                    (unsigned long long)j->worker_start_unix_ns,
-                   (unsigned long long)unix_time_ns());
+                   (unsigned long long)worker_done_unix_ns);
+        if (j->inference_span_id[0]) {
+            otlp_span_record record = {0};
+            memcpy(record.trace_id, j->corr.trace_id, sizeof(record.trace_id));
+            memcpy(record.span_id, j->inference_span_id, sizeof(record.span_id));
+            memcpy(record.parent_span_id, j->corr.parent_span_id,
+                   sizeof(record.parent_span_id));
+            record.trace_flags = j->corr.trace_flags;
+            memcpy(record.session_id, j->corr.session_id, sizeof(record.session_id));
+            memcpy(record.call_id, j->corr.call_id, sizeof(record.call_id));
+            memcpy(record.client_id, j->corr.client_id, sizeof(record.client_id));
+            memcpy(record.agent_id, j->corr.agent_id, sizeof(record.agent_id));
+            record.queue_accepted_unix_ns = j->queue_accepted_unix_ns;
+            record.worker_start_unix_ns = j->worker_start_unix_ns;
+            record.worker_done_unix_ns = worker_done_unix_ns;
+            (void)otlp_exporter_submit(&s->otlp, &record);
+        }
         correlation_log_set(NULL);
         pthread_mutex_lock(&j->mu);
         j->done = true;
@@ -11268,6 +11687,8 @@ static bool parse_traceparent(const char *value, correlation_context *corr) {
     }
     memcpy(corr->trace_id, trace_id, sizeof(trace_id));
     memcpy(corr->parent_span_id, parent_span_id, sizeof(parent_span_id));
+    corr->trace_flags = (uint8_t)((hex_digit_value(flags[0]) << 4) |
+                                  hex_digit_value(flags[1]));
     return true;
 }
 
@@ -11583,6 +12004,8 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
+    bool otlp_traces_enabled;
+    otlp_http_endpoint otlp_traces_endpoint;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -11641,6 +12064,7 @@ static void log_context_memory(ds4_backend backend,
 }
 
 static void server_close_resources(server *s) {
+    otlp_exporter_stop(&s->otlp);
     if (s->trace) {
         fclose(s->trace);
         s->trace = NULL;
@@ -11757,6 +12181,14 @@ static server_config parse_options(int argc, char **argv) {
             c.enable_cors = true;
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--otlp-traces-endpoint")) {
+            const char *value = need_arg(&i, argc, argv, arg);
+            if (!otlp_http_endpoint_parse(value, &c.otlp_traces_endpoint)) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --otlp-traces-endpoint must be loopback HTTP, e.g. http://127.0.0.1:4322/v1/traces");
+                exit(2);
+            }
+            c.otlp_traces_enabled = true;
         } else if (!strcmp(arg, "--kv-disk-dir")) {
             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
@@ -11944,6 +12376,9 @@ int main(int argc, char **argv) {
         }
         setvbuf(s.trace, NULL, _IONBF, 0);
         server_log(DS4_LOG_DEFAULT, "ds4-server: tracing session to %s", cfg.trace_path);
+    }
+    if (cfg.otlp_traces_enabled) {
+        (void)otlp_exporter_start(&s.otlp, &cfg.otlp_traces_endpoint);
     }
 
     pthread_t worker;
@@ -14692,6 +15127,246 @@ static void test_client_socket_nonblocking_flag(void) {
     close(sv[1]);
 }
 
+static otlp_span_record test_otlp_span_record(void) {
+    otlp_span_record record = {0};
+    strcpy(record.trace_id, "0123456789abcdef0123456789abcdef");
+    strcpy(record.span_id, "1111222233334444");
+    strcpy(record.parent_span_id, "abcdef0123456789");
+    record.trace_flags = 1;
+    strcpy(record.session_id, "session-test");
+    strcpy(record.call_id, "call-test");
+    strcpy(record.client_id, "macminim4");
+    strcpy(record.agent_id, "codex-ds4");
+    record.queue_accepted_unix_ns = 1000000000ull;
+    record.worker_start_unix_ns = 1250000000ull;
+    record.worker_done_unix_ns = 2000000000ull;
+    return record;
+}
+
+static bool test_wait_counter(uint64_t *counter, uint64_t target,
+                              int timeout_ms) {
+    long long deadline = wall_ms() + timeout_ms;
+    while (wall_ms() < deadline) {
+        if (__sync_fetch_and_add(counter, 0) >= target) return true;
+        struct timespec delay = {.tv_sec = 0, .tv_nsec = 10 * 1000 * 1000};
+        nanosleep(&delay, NULL);
+    }
+    return __sync_fetch_and_add(counter, 0) >= target;
+}
+
+typedef struct {
+    int listen_fd;
+    uint16_t port;
+    pthread_t thread;
+    char *body;
+} test_otlp_receiver;
+
+static void *test_otlp_receiver_main(void *arg) {
+    test_otlp_receiver *receiver = arg;
+    if (!otlp_wait_fd(receiver->listen_fd, POLLIN, wall_ms() + 3000)) return NULL;
+    int fd = accept(receiver->listen_fd, NULL, NULL);
+    if (fd < 0) return NULL;
+    struct timeval timeout = {.tv_sec = 2, .tv_usec = 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    buf request = {0};
+    ssize_t hend = -1;
+    long content_len = -1;
+    for (;;) {
+        char chunk[2048];
+        ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        buf_append(&request, chunk, (size_t)n);
+        if (hend < 0) {
+            hend = header_end(request.ptr, request.len);
+            if (hend >= 0) {
+                content_len = content_length(request.ptr, (size_t)hend);
+            }
+        }
+        if (hend >= 0 && content_len >= 0 &&
+            request.len >= (size_t)hend + (size_t)content_len) {
+            receiver->body = xstrndup(request.ptr + hend, (size_t)content_len);
+            break;
+        }
+    }
+    const char response[] =
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        "Content-Length: 21\r\nConnection: close\r\n\r\n"
+        "{\"partialSuccess\":{}}";
+    (void)send(fd, response, sizeof(response) - 1, 0);
+    buf_free(&request);
+    close(fd);
+    return NULL;
+}
+
+static bool test_otlp_receiver_start(test_otlp_receiver *receiver) {
+    memset(receiver, 0, sizeof(*receiver));
+    receiver->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (receiver->listen_fd < 0) return false;
+    int yes = 1;
+    setsockopt(receiver->listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = 0;
+    if (bind(receiver->listen_fd, (struct sockaddr *)&sa, sizeof(sa)) != 0 ||
+        listen(receiver->listen_fd, 1) != 0) {
+        close(receiver->listen_fd);
+        receiver->listen_fd = -1;
+        return false;
+    }
+    socklen_t salen = sizeof(sa);
+    if (getsockname(receiver->listen_fd, (struct sockaddr *)&sa, &salen) != 0) {
+        close(receiver->listen_fd);
+        receiver->listen_fd = -1;
+        return false;
+    }
+    receiver->port = ntohs(sa.sin_port);
+    if (pthread_create(&receiver->thread, NULL, test_otlp_receiver_main,
+                       receiver) != 0) {
+        close(receiver->listen_fd);
+        receiver->listen_fd = -1;
+        return false;
+    }
+    return true;
+}
+
+static void test_otlp_receiver_stop(test_otlp_receiver *receiver) {
+    pthread_join(receiver->thread, NULL);
+    close(receiver->listen_fd);
+    receiver->listen_fd = -1;
+}
+
+static void test_otlp_endpoint_validation(void) {
+    otlp_http_endpoint endpoint = {0};
+    TEST_ASSERT(otlp_http_endpoint_parse(
+        "http://127.0.0.1:4322/v1/traces", &endpoint));
+    TEST_ASSERT(endpoint.port == 4322);
+    TEST_ASSERT(!strcmp(endpoint.path, "/v1/traces"));
+    TEST_ASSERT(otlp_http_endpoint_parse(
+        "http://localhost:4318/custom", &endpoint));
+    TEST_ASSERT(endpoint.port == 4318);
+    TEST_ASSERT(!otlp_http_endpoint_parse(
+        "https://127.0.0.1:4322/v1/traces", &endpoint));
+    TEST_ASSERT(!otlp_http_endpoint_parse(
+        "http://192.168.1.2:4322/v1/traces", &endpoint));
+    TEST_ASSERT(!otlp_http_endpoint_parse(
+        "http://127.0.0.1:0/v1/traces", &endpoint));
+}
+
+static void test_inference_span_id_is_lower_hex_nonzero(void) {
+    char span_id[17] = {0};
+    TEST_ASSERT(make_span_id(span_id));
+    TEST_ASSERT(strlen(span_id) == 16);
+    TEST_ASSERT(strcmp(span_id, "0000000000000000") != 0);
+    for (size_t i = 0; i < 16; i++) {
+        TEST_ASSERT((span_id[i] >= '0' && span_id[i] <= '9') ||
+                    (span_id[i] >= 'a' && span_id[i] <= 'f'));
+    }
+}
+
+static void test_otlp_payload_parent_child_timing_and_attributes(void) {
+    otlp_span_record record = test_otlp_span_record();
+    char *payload = otlp_span_payload(&record);
+    const char *p = payload;
+    TEST_ASSERT(json_skip_value(&p));
+    json_ws(&p);
+    TEST_ASSERT(*p == '\0');
+    TEST_ASSERT(strstr(payload, "\"traceId\":\"0123456789abcdef0123456789abcdef\"") != NULL);
+    TEST_ASSERT(strstr(payload, "\"spanId\":\"1111222233334444\"") != NULL);
+    TEST_ASSERT(strstr(payload, "\"parentSpanId\":\"abcdef0123456789\"") != NULL);
+    TEST_ASSERT(strstr(payload, "\"name\":\"ds4.inference\",\"kind\":2") != NULL);
+    TEST_ASSERT(strstr(payload, "\"startTimeUnixNano\":\"1000000000\"") != NULL);
+    TEST_ASSERT(strstr(payload, "\"endTimeUnixNano\":\"2000000000\"") != NULL);
+    TEST_ASSERT(strstr(payload, "\"key\":\"ds4.queue.wait_ms\",\"value\":{\"doubleValue\":250.000000}") != NULL);
+    TEST_ASSERT(strstr(payload, "\"key\":\"ds4.worker.duration_ms\",\"value\":{\"doubleValue\":750.000000}") != NULL);
+    TEST_ASSERT(strstr(payload, "\"name\":\"ds4.queue.accepted\"") != NULL);
+    TEST_ASSERT(strstr(payload, "\"name\":\"ds4.worker.started\"") != NULL);
+    TEST_ASSERT(strstr(payload, "\"name\":\"ds4.worker.done\"") != NULL);
+    TEST_ASSERT(strstr(payload, "prompt") == NULL);
+    TEST_ASSERT(strstr(payload, "response") == NULL);
+    free(payload);
+}
+
+static void test_otlp_disabled_is_noop(void) {
+    otlp_span_exporter exporter;
+    TEST_ASSERT(otlp_exporter_start(&exporter, NULL));
+    TEST_ASSERT(!exporter.enabled);
+    otlp_span_record record = test_otlp_span_record();
+    TEST_ASSERT(!otlp_exporter_submit(&exporter, &record));
+    TEST_ASSERT(exporter.submitted == 0);
+    TEST_ASSERT(exporter.exported == 0);
+    otlp_exporter_stop(&exporter);
+}
+
+static void test_otlp_queue_full_submit_is_nonblocking(void) {
+    otlp_span_exporter exporter;
+    memset(&exporter, 0, sizeof(exporter));
+    TEST_ASSERT(pthread_mutex_init(&exporter.mu, NULL) == 0);
+    TEST_ASSERT(pthread_cond_init(&exporter.cv, NULL) == 0);
+    exporter.enabled = true;
+    exporter.count = OTLP_SPAN_QUEUE_CAPACITY;
+    otlp_span_record record = test_otlp_span_record();
+    double start = now_sec();
+    TEST_ASSERT(!otlp_exporter_submit(&exporter, &record));
+    TEST_ASSERT(now_sec() - start < 0.050);
+    TEST_ASSERT(__sync_fetch_and_add(&exporter.dropped, 0) == 1);
+    otlp_exporter_stop(&exporter);
+}
+
+static void test_otlp_mock_receiver_accepts_payload(void) {
+    test_otlp_receiver receiver;
+    TEST_ASSERT(test_otlp_receiver_start(&receiver));
+    if (receiver.listen_fd < 0) return;
+    otlp_http_endpoint endpoint = {.port = receiver.port};
+    strcpy(endpoint.path, "/v1/traces");
+    otlp_span_exporter exporter;
+    TEST_ASSERT(otlp_exporter_start(&exporter, &endpoint));
+    otlp_span_record record = test_otlp_span_record();
+    TEST_ASSERT(otlp_exporter_submit(&exporter, &record));
+    TEST_ASSERT(test_wait_counter(&exporter.exported, 1, 3000));
+    otlp_exporter_stop(&exporter);
+    test_otlp_receiver_stop(&receiver);
+    TEST_ASSERT(receiver.body != NULL);
+    if (receiver.body) {
+        const char *p = receiver.body;
+        TEST_ASSERT(json_skip_value(&p));
+        json_ws(&p);
+        TEST_ASSERT(*p == '\0');
+        TEST_ASSERT(strstr(receiver.body, "\"parentSpanId\":\"abcdef0123456789\"") != NULL);
+    }
+    free(receiver.body);
+}
+
+static void test_otlp_unused_port_fails_open(void) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    TEST_ASSERT(fd >= 0);
+    if (fd < 0) return;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = 0;
+    TEST_ASSERT(bind(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0);
+    socklen_t salen = sizeof(sa);
+    TEST_ASSERT(getsockname(fd, (struct sockaddr *)&sa, &salen) == 0);
+    uint16_t unused_port = ntohs(sa.sin_port);
+    close(fd);
+
+    otlp_http_endpoint endpoint = {.port = unused_port};
+    strcpy(endpoint.path, "/v1/traces");
+    otlp_span_exporter exporter;
+    TEST_ASSERT(otlp_exporter_start(&exporter, &endpoint));
+    otlp_span_record record = test_otlp_span_record();
+    double start = now_sec();
+    TEST_ASSERT(otlp_exporter_submit(&exporter, &record));
+    TEST_ASSERT(now_sec() - start < 0.050);
+    TEST_ASSERT(test_wait_counter(&exporter.failed, 1, 4000));
+    otlp_exporter_stop(&exporter);
+}
+
 static void test_http_request_preserves_correlation_headers(void) {
     int sv[2] = {-1, -1};
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -14721,9 +15396,53 @@ static void test_http_request_preserves_correlation_headers(void) {
     TEST_ASSERT(!strcmp(r.corr.agent_id, "codex-ds4"));
     TEST_ASSERT(!strcmp(r.corr.trace_id, "0123456789abcdef0123456789abcdef"));
     TEST_ASSERT(!strcmp(r.corr.parent_span_id, "abcdef0123456789"));
+    TEST_ASSERT(r.corr.trace_flags == 0);
     http_request_free(&r);
     close(sv[0]);
     close(sv[1]);
+}
+
+static void test_traceparent_preserves_sampled_flags(void) {
+    correlation_context corr = {0};
+    TEST_ASSERT(parse_traceparent(
+        "00-0123456789abcdef0123456789abcdef-abcdef0123456789-01", &corr));
+    TEST_ASSERT(corr.trace_flags == 1);
+    TEST_ASSERT(correlation_context_is_sampled(&corr));
+
+    memset(&corr, 0, sizeof(corr));
+    TEST_ASSERT(parse_traceparent(
+        "00-0123456789abcdef0123456789abcdef-abcdef0123456789-a0", &corr));
+    TEST_ASSERT(corr.trace_flags == 0xa0);
+    TEST_ASSERT(!correlation_context_is_sampled(&corr));
+
+    memset(&corr, 0, sizeof(corr));
+    TEST_ASSERT(!parse_traceparent(
+        "00-0123456789abcdef0123456789abcdef-abcdef0123456789-zz", &corr));
+    TEST_ASSERT(corr.trace_id[0] == '\0');
+}
+
+static void test_enqueue_span_generation_follows_exporter_state(void) {
+    server s;
+    memset(&s, 0, sizeof(s));
+    TEST_ASSERT(pthread_mutex_init(&s.mu, NULL) == 0);
+    TEST_ASSERT(pthread_cond_init(&s.cv, NULL) == 0);
+
+    job disabled = {0};
+    TEST_ASSERT(parse_traceparent(
+        "00-0123456789abcdef0123456789abcdef-abcdef0123456789-01",
+        &disabled.corr));
+    TEST_ASSERT(enqueue(&s, &disabled));
+    TEST_ASSERT(disabled.inference_span_id[0] == '\0');
+
+    s.head = s.tail = NULL;
+    s.otlp.enabled = true;
+    job enabled = {0};
+    enabled.corr = disabled.corr;
+    TEST_ASSERT(enqueue(&s, &enabled));
+    TEST_ASSERT(strlen(enabled.inference_span_id) == 16);
+
+    pthread_cond_destroy(&s.cv);
+    pthread_mutex_destroy(&s.mu);
 }
 
 static void test_correlation_headers_reject_unsafe_values(void) {
@@ -15976,7 +16695,16 @@ static void ds4_server_unit_tests_run(void) {
     test_json_skip_has_nesting_limit();
     test_model_metadata_clamps_completion_to_context();
     test_client_socket_nonblocking_flag();
+    test_otlp_endpoint_validation();
+    test_inference_span_id_is_lower_hex_nonzero();
+    test_otlp_payload_parent_child_timing_and_attributes();
+    test_otlp_disabled_is_noop();
+    test_otlp_queue_full_submit_is_nonblocking();
+    test_otlp_mock_receiver_accepts_payload();
+    test_otlp_unused_port_fails_open();
     test_http_request_preserves_correlation_headers();
+    test_traceparent_preserves_sampled_flags();
+    test_enqueue_span_generation_follows_exporter_state();
     test_correlation_headers_reject_unsafe_values();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();
