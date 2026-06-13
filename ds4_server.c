@@ -7593,6 +7593,48 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
+static uint64_t unix_time_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+#define CORRELATION_ID_MAX 192
+
+typedef struct {
+    char session_id[CORRELATION_ID_MAX];
+    char call_id[CORRELATION_ID_MAX];
+    char trace_id[33];
+    char parent_span_id[17];
+    char client_id[CORRELATION_ID_MAX];
+    char agent_id[CORRELATION_ID_MAX];
+} correlation_context;
+
+static pthread_key_t correlation_log_key;
+static pthread_once_t correlation_log_key_once = PTHREAD_ONCE_INIT;
+
+static void correlation_log_key_create(void) {
+    if (pthread_key_create(&correlation_log_key, NULL) != 0) {
+        die("failed to create correlation log key");
+    }
+}
+
+static void correlation_log_set(const correlation_context *corr) {
+    pthread_once(&correlation_log_key_once, correlation_log_key_create);
+    if (pthread_setspecific(correlation_log_key, corr) != 0) {
+        die("failed to set correlation log context");
+    }
+}
+
+static const correlation_context *correlation_log_get(void) {
+    pthread_once(&correlation_log_key_once, correlation_log_key_create);
+    return pthread_getspecific(correlation_log_key);
+}
+
+static const char *correlation_value(const char *value) {
+    return value && value[0] ? value : "unknown";
+}
+
 static void server_log(ds4_log_type type, const char *fmt, ...) {
     time_t now = time(NULL);
     struct tm tm;
@@ -7607,6 +7649,7 @@ static void server_log(ds4_log_type type, const char *fmt, ...) {
     int n = vsnprintf(NULL, 0, fmt, copy);
     va_end(copy);
 
+    flockfile(stderr);
     fprintf(stderr, "%s ", ts);
     if (n < 0) {
         ds4_log(stderr, type, "%s", fmt);
@@ -7616,8 +7659,19 @@ static void server_log(ds4_log_type type, const char *fmt, ...) {
         ds4_log(stderr, type, "%s", line);
         free(line);
     }
+    const correlation_context *corr = correlation_log_get();
+    if (corr) {
+        fprintf(stderr,
+                " session_id=\"%s\" call_id=\"%s\" trace_id=\"%s\" client_id=\"%s\" agent_id=\"%s\"",
+                correlation_value(corr->session_id),
+                correlation_value(corr->call_id),
+                correlation_value(corr->trace_id),
+                correlation_value(corr->client_id),
+                correlation_value(corr->agent_id));
+    }
     va_end(ap);
     fputc('\n', stderr);
+    funlockfile(stderr);
 }
 
 typedef struct job job;
@@ -7728,6 +7782,9 @@ struct server {
 struct job {
     int fd;
     request req;
+    correlation_context corr;
+    uint64_t queue_accepted_unix_ns;
+    uint64_t worker_start_unix_ns;
     bool done;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -11045,6 +11102,7 @@ static bool enqueue(server *s, job *j) {
         pthread_mutex_unlock(&s->mu);
         return false;
     }
+    j->queue_accepted_unix_ns = unix_time_ns();
     if (s->tail) s->tail->next = j; else s->head = j;
     s->tail = j;
     pthread_cond_signal(&s->cv);
@@ -11072,7 +11130,22 @@ static void *worker_main(void *arg) {
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
+        j->worker_start_unix_ns = unix_time_ns();
+        correlation_log_set(&j->corr);
+        double queue_wait_ms = j->worker_start_unix_ns >= j->queue_accepted_unix_ns
+            ? (double)(j->worker_start_unix_ns - j->queue_accepted_unix_ns) / 1000000.0
+            : 0.0;
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: event=worker_start queue_accepted_unix_ns=%llu worker_start_unix_ns=%llu queue_wait_ms=%.3f",
+                   (unsigned long long)j->queue_accepted_unix_ns,
+                   (unsigned long long)j->worker_start_unix_ns,
+                   queue_wait_ms);
         generate_job(s, j);
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: event=worker_done worker_start_unix_ns=%llu worker_done_unix_ns=%llu",
+                   (unsigned long long)j->worker_start_unix_ns,
+                   (unsigned long long)unix_time_ns());
+        correlation_log_set(NULL);
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -11086,6 +11159,7 @@ typedef struct {
     char path[256];
     char *body;
     size_t body_len;
+    correlation_context corr;
 } http_request;
 
 static void http_request_free(http_request *r) {
@@ -11120,6 +11194,102 @@ static long content_length(const char *h, size_t n) {
     return 0;
 }
 
+static bool correlation_header_char(unsigned char c) {
+    return c > 0x20 && c < 0x7f && c != '"' && c != '\\';
+}
+
+static bool copy_header_value(const char *h, size_t n, const char *name,
+                              char *dst, size_t dstlen) {
+    const size_t name_len = strlen(name);
+    const char *p = h, *end = h + n;
+    if (dstlen) dst[0] = '\0';
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len > name_len && line[name_len] == ':' &&
+            strncasecmp(line, name, name_len) == 0)
+        {
+            const char *v = line + name_len + 1;
+            const char *vend = line + len;
+            while (v < vend && isspace((unsigned char)*v)) v++;
+            while (vend > v && isspace((unsigned char)vend[-1])) vend--;
+            size_t value_len = (size_t)(vend - v);
+            if (!value_len || value_len >= dstlen) return false;
+            for (size_t i = 0; i < value_len; i++) {
+                if (!correlation_header_char((unsigned char)v[i])) return false;
+            }
+            memcpy(dst, v, value_len);
+            dst[value_len] = '\0';
+            return true;
+        }
+        if (p < end) p++;
+    }
+    return false;
+}
+
+static int hex_digit_value(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static bool copy_lower_hex(char *dst, const char *src, size_t len,
+                           bool require_nonzero) {
+    static const char hex[] = "0123456789abcdef";
+    bool any_nonzero = false;
+    for (size_t i = 0; i < len; i++) {
+        int value = hex_digit_value(src[i]);
+        if (value < 0) return false;
+        if (value) any_nonzero = true;
+        dst[i] = hex[value];
+    }
+    dst[len] = '\0';
+    return !require_nonzero || any_nonzero;
+}
+
+static bool parse_traceparent(const char *value, correlation_context *corr) {
+    if (!value || strlen(value) != 55 ||
+        value[2] != '-' || value[35] != '-' || value[52] != '-' ||
+        value[0] != '0' || value[1] != '0')
+    {
+        return false;
+    }
+    char trace_id[33];
+    char parent_span_id[17];
+    char flags[3];
+    if (!copy_lower_hex(trace_id, value + 3, 32, true) ||
+        !copy_lower_hex(parent_span_id, value + 36, 16, true) ||
+        !copy_lower_hex(flags, value + 53, 2, false))
+    {
+        return false;
+    }
+    memcpy(corr->trace_id, trace_id, sizeof(trace_id));
+    memcpy(corr->parent_span_id, parent_span_id, sizeof(parent_span_id));
+    return true;
+}
+
+static void correlation_from_headers(correlation_context *corr,
+                                     const char *headers, size_t header_len) {
+    memset(corr, 0, sizeof(*corr));
+    copy_header_value(headers, header_len, "X-LLM-Session-ID",
+                      corr->session_id, sizeof(corr->session_id));
+    copy_header_value(headers, header_len, "X-LLM-Call-ID",
+                      corr->call_id, sizeof(corr->call_id));
+    copy_header_value(headers, header_len, "X-LLM-Client",
+                      corr->client_id, sizeof(corr->client_id));
+    copy_header_value(headers, header_len, "X-LLM-Agent",
+                      corr->agent_id, sizeof(corr->agent_id));
+    char traceparent[64];
+    if (copy_header_value(headers, header_len, "traceparent",
+                          traceparent, sizeof(traceparent)))
+    {
+        parse_traceparent(traceparent, corr);
+    }
+}
+
 static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
@@ -11149,6 +11319,7 @@ static bool read_http_request(int fd, http_request *r) {
 
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
+    correlation_from_headers(&r->corr, b.ptr, (size_t)hend);
     while (b.len < (size_t)hend + (size_t)clen) {
         char tmp[8192];
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
@@ -11258,6 +11429,8 @@ static void *client_main(void *arg) {
         http_error(fd, s->enable_cors, 400, "bad HTTP request");
         goto done;
     }
+    correlation_context corr = hr.corr;
+    correlation_log_set(&corr);
 
     if (!strcmp(hr.method, "OPTIONS")) {
         http_response(fd, s->enable_cors, 204, NULL, "");
@@ -11323,6 +11496,7 @@ static void *client_main(void *arg) {
     memset(&j, 0, sizeof(j));
     j.fd = fd;
     j.req = req;
+    j.corr = corr;
     pthread_mutex_init(&j.mu, NULL);
     pthread_cond_init(&j.cv, NULL);
 
@@ -11335,6 +11509,9 @@ static void *client_main(void *arg) {
         request_free(&j.req);
         goto done;
     }
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: event=queue_accepted queue_accepted_unix_ns=%llu",
+               (unsigned long long)j.queue_accepted_unix_ns);
     while (!j.done) pthread_cond_wait(&j.cv, &j.mu);
     pthread_mutex_unlock(&j.mu);
 
@@ -11342,6 +11519,7 @@ static void *client_main(void *arg) {
     pthread_mutex_destroy(&j.mu);
     request_free(&j.req);
 done:
+    correlation_log_set(NULL);
     close(fd);
     client_done(s);
     return NULL;
@@ -14514,6 +14692,55 @@ static void test_client_socket_nonblocking_flag(void) {
     close(sv[1]);
 }
 
+static void test_http_request_preserves_correlation_headers(void) {
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    const char *raw =
+        "POST /v1/responses?ignored=1 HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Content-Length: 2\r\n"
+        "Traceparent: 00-0123456789ABCDEF0123456789ABCDEF-ABCDEF0123456789-00\r\n"
+        "X-LLM-Session-ID: session-test\r\n"
+        "X-LLM-Call-ID: call-test\r\n"
+        "X-LLM-Client: macminim4\r\n"
+        "X-LLM-Agent: codex-ds4\r\n"
+        "\r\n{}";
+    TEST_ASSERT(write(sv[0], raw, strlen(raw)) == (ssize_t)strlen(raw));
+    shutdown(sv[0], SHUT_WR);
+
+    http_request r = {0};
+    TEST_ASSERT(read_http_request(sv[1], &r));
+    TEST_ASSERT(!strcmp(r.method, "POST"));
+    TEST_ASSERT(!strcmp(r.path, "/v1/responses"));
+    TEST_ASSERT(!strcmp(r.body, "{}"));
+    TEST_ASSERT(!strcmp(r.corr.session_id, "session-test"));
+    TEST_ASSERT(!strcmp(r.corr.call_id, "call-test"));
+    TEST_ASSERT(!strcmp(r.corr.client_id, "macminim4"));
+    TEST_ASSERT(!strcmp(r.corr.agent_id, "codex-ds4"));
+    TEST_ASSERT(!strcmp(r.corr.trace_id, "0123456789abcdef0123456789abcdef"));
+    TEST_ASSERT(!strcmp(r.corr.parent_span_id, "abcdef0123456789"));
+    http_request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_correlation_headers_reject_unsafe_values(void) {
+    const char *headers =
+        "POST /v1/responses HTTP/1.1\r\n"
+        "traceparent: 00-00000000000000000000000000000000-0000000000000000-01\r\n"
+        "X-LLM-Session-ID: bad\"session\r\n"
+        "X-LLM-Call-ID: call-safe\r\n"
+        "\r\n";
+    correlation_context corr;
+    correlation_from_headers(&corr, headers, strlen(headers));
+    TEST_ASSERT(corr.session_id[0] == '\0');
+    TEST_ASSERT(!strcmp(corr.call_id, "call-safe"));
+    TEST_ASSERT(corr.trace_id[0] == '\0');
+    TEST_ASSERT(corr.parent_span_id[0] == '\0');
+}
+
 static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -15749,6 +15976,8 @@ static void ds4_server_unit_tests_run(void) {
     test_json_skip_has_nesting_limit();
     test_model_metadata_clamps_completion_to_context();
     test_client_socket_nonblocking_flag();
+    test_http_request_preserves_correlation_headers();
+    test_correlation_headers_reject_unsafe_values();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();
     test_tool_marker_state_ignores_orphan_end();
